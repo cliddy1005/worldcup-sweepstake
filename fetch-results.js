@@ -64,6 +64,7 @@ async function run(){
   const stages = new Array(TEAM_ORDER.length).fill(0);
   const koMap  = {};
   let   nextUp = null;
+  const redCandidates = [];
   const bump = (name,val) => { const i=TIDX[name]; if(i!==undefined && val>stages[i]) stages[i]=val; };
   const spotWhere = (a,b,d) => {
     if(PAIR2K[a+"|"+b]!==undefined) return "Grp " + MATCHES[PAIR2K[a+"|"+b]].g;
@@ -92,6 +93,7 @@ async function run(){
         const n1 = findTeam(cs[1].team && (cs[1].team.displayName||cs[1].team.name));
         if(!n0 || !n1) continue;
         const evDate = ev.date ? new Date(ev.date) : null;
+        if((stype.state==="post"||stype.state==="in") && ev.id && evDate) redCandidates.push({id:ev.id, date:evDate});
         const k = PAIR2K[n0 + "|" + n1];
         const s0 = parseInt(cs[0].score,10), s1 = parseInt(cs[1].score,10);
         const winnerName = (!isNaN(s0)&&!isNaN(s1)) ? (s0>s1?n0 : s1>s0?n1 : null)
@@ -117,12 +119,55 @@ async function run(){
     }catch(e){ /* skip a bad day */ }
   }
 
+  // ---- first red card of the tournament (per-match summary endpoint) ----
+  const keTeamId = ke => {
+    if(!ke.team) return null;
+    if(ke.team.id!=null) return String(ke.team.id);
+    if(ke.team.$ref){ const m=String(ke.team.$ref).match(/teams\/(\d+)/); return m?m[1]:null; }
+    return null;
+  };
+  const clockSecs = ke => {
+    if(ke.clock && ke.clock.value!=null) return ke.clock.value;
+    const dv=(ke.clock&&ke.clock.displayValue)||""; const m=dv.match(/(\d+)/);
+    return m?parseInt(m[1],10)*60:0;
+  };
+  async function matchFirstRed(id, dateObj){
+    try{
+      const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/soccer/${LEAGUE}/summary?event=${id}`);
+      if(!r.ok) return null;
+      const j = await r.json();
+      const id2name={};
+      const comps=(j.header&&j.header.competitions&&j.header.competitions[0]&&j.header.competitions[0].competitors)||[];
+      comps.forEach(c=>{ if(c.team){ const nm=findTeam(c.team.displayName||c.team.name||c.team.shortDisplayName); if(nm) id2name[String(c.team.id)]=nm; }});
+      let best=null;
+      for(const ke of (j.keyEvents||[])){
+        const txt=((ke.type&&(ke.type.text||ke.type.name))||"").toLowerCase();
+        if(!txt.includes("red")) continue;
+        const tid=keTeamId(ke); const team=tid?id2name[tid]:null; if(!team) continue;
+        const secs=clockSecs(ke);
+        const minute=(ke.clock&&ke.clock.displayValue)||(Math.round(secs/60)+"'");
+        if(best===null || secs<best.secs) best={team, minute, secs};
+      }
+      if(!best) return null;
+      return { team:best.team, minute:best.minute, when:dateObj.getTime()+best.secs*1000 };
+    }catch(e){ return null; }
+  }
+  let firstRed=null;
+  redCandidates.sort((a,b)=>a.date-b.date);
+  let rb=24;                                   // cap summary fetches
+  for(const c of redCandidates){
+    if(rb--<=0) break;
+    const red=await matchFirstRed(c.id, c.date);
+    if(red){ firstRed={team:red.team, minute:red.minute}; break; }  // earliest match with a red card
+  }
+
   const next = nextUp ? { a:nextUp.a, b:nextUp.b, date:nextUp.date, where:nextUp.where } : null;
-  const out = { group: gres.join(""), scores, stages: stages.join(""), ko: Object.values(koMap), next, updated: new Date().toISOString() };
+  const out = { group: gres.join(""), scores, stages: stages.join(""), ko: Object.values(koMap), next, firstRed, updated: new Date().toISOString() };
   fs.writeFileSync("results.json", JSON.stringify(out));
   console.log(`Wrote results.json — ${gres.filter(x=>x).length}/${MATCHES.length} group games, `
     + `${Object.keys(koMap).length} knockout games, ${stages.filter(x=>x).length} teams with a stage`
-    + (next ? `, next: ${next.a} v ${next.b}` : "") + ".");
+    + (next ? `, next: ${next.a} v ${next.b}` : "")
+    + (firstRed ? `, first red: ${firstRed.team} ${firstRed.minute}` : "") + ".");
 }
 
 run();
